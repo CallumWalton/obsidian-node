@@ -209,18 +209,14 @@ git clone https://github.com/CallumWalton/obsidian-node.git
 cd obsidian-node
 
 # Copy the bootstrap script
-cp obsidian_cnc_bootstrap.sh /root/
-chmod +x /root/obsidian_cnc_bootstrap.sh
-
-# Substitute variables and create final script
-envsubst < /root/obsidian_cnc_bootstrap.sh > /root/cnc_bootstrap_final.sh
-chmod +x /root/cnc_bootstrap_final.sh
+cp obsidian_cnc_bootstrap.py /root/
+chmod +x /root/obsidian_cnc_bootstrap.py
 ```
 
 ### Step 2.6: Execute Bootstrap Script
 ```bash
-# Run the bootstrap script (this will take 10-15 minutes)
-/root/cnc_bootstrap_final.sh 2>&1 | tee /var/log/obsidian-cnc-bootstrap.log
+# Run the Python bootstrap script (this will take 10-15 minutes)
+python3 /root/obsidian_cnc_bootstrap.py 2>&1 | tee /var/log/obsidian-cnc-bootstrap.log
 
 # Monitor progress
 tail -f /var/log/obsidian-cnc-bootstrap.log
@@ -440,8 +436,8 @@ qrencode -t ansiutf8 < /etc/wireguard/clients/admin-laptop.conf
    cd /tmp
    git clone https://github.com/CallumWalton/obsidian-node.git
    cd obsidian-node
-   cp obsidian_bootstrap.sh /root/
-   chmod +x /root/obsidian_bootstrap.sh
+   cp obsidian_bootstrap.py /root/
+   chmod +x /root/obsidian_bootstrap.py
    ```
 
 4. **Prepare Client WireGuard Configuration**
@@ -464,12 +460,8 @@ qrencode -t ansiutf8 < /etc/wireguard/clients/admin-laptop.conf
    # Load configuration
    source /root/client.env
    
-   # Substitute variables and create final script
-   envsubst < /root/obsidian_bootstrap.sh > /root/bootstrap_final.sh
-   chmod +x /root/bootstrap_final.sh
-   
-   # Run bootstrap script
-   /root/bootstrap_final.sh 2>&1 | tee /var/log/obsidian-bootstrap.log
+   # Run Python bootstrap script
+   python3 /root/obsidian_bootstrap.py 2>&1 | tee /var/log/obsidian-bootstrap.log
    ```
 
 ---

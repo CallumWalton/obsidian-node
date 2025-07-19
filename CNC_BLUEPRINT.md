@@ -147,16 +147,14 @@ WireGuard VPN Server -> Private Network (10.0.0.0/24)
 #### Method 1: Direct Execution (Recommended)
 ```bash
 # Download and prepare script
-curl -o obsidian_cnc_bootstrap.sh https://your-repo.com/obsidian_cnc_bootstrap.sh
-chmod +x obsidian_cnc_bootstrap.sh
+curl -o obsidian_cnc_bootstrap.py https://raw.githubusercontent.com/CallumWalton/obsidian-node/main/obsidian_cnc_bootstrap.py
+chmod +x obsidian_cnc_bootstrap.py
 
 # Load configuration
 source /root/obsidian-cnc.env
 
-# Substitute variables and execute
-envsubst < obsidian_cnc_bootstrap.sh > cnc_bootstrap_configured.sh
-chmod +x cnc_bootstrap_configured.sh
-./cnc_bootstrap_configured.sh 2>&1 | tee /var/log/obsidian-cnc-bootstrap.log
+# Execute Python script
+python3 obsidian_cnc_bootstrap.py 2>&1 | tee /var/log/obsidian-cnc-bootstrap.log
 ```
 
 #### Method 2: Terraform Deployment
@@ -234,17 +232,15 @@ write_files:
       export EMAIL="${EMAIL}"
       # ... all environment variables
 
-  - path: /tmp/obsidian_cnc_bootstrap.sh
+  - path: /tmp/obsidian_cnc_bootstrap.py
     permissions: '0755'
     encoding: b64
     content: |
-      [BASE64_ENCODED_SCRIPT_CONTENT]
+      [BASE64_ENCODED_PYTHON_SCRIPT_CONTENT]
 
 runcmd:
   - source /root/obsidian-cnc.env
-  - envsubst < /tmp/obsidian_cnc_bootstrap.sh > /tmp/cnc_configured.sh
-  - chmod +x /tmp/cnc_configured.sh
-  - /tmp/cnc_configured.sh 2>&1 | tee /var/log/obsidian-cnc-bootstrap.log
+  - python3 /tmp/obsidian_cnc_bootstrap.py 2>&1 | tee /var/log/obsidian-cnc-bootstrap.log
 ```
 
 ---
@@ -607,6 +603,10 @@ This Command & Control server is the central hub for your entire Obsidian platfo
 - Strong passwords for all administrative accounts
 - Regular security updates and patches
 - Backup and disaster recovery procedures tested
+- Network access restricted to authorized personnel only
+- Multi-factor authentication enabled for all admin access
+
+**For emergency recovery, maintain offline backups of critical configuration files and access credentials.**
 - Network access restricted to authorized personnel only
 - Multi-factor authentication enabled for all admin access
 

@@ -491,14 +491,12 @@ runcmd:
   - cd /tmp
   - git clone https://github.com/CallumWalton/obsidian-node.git
   - cd obsidian-node
-  - cp obsidian_cnc_bootstrap.sh /root/
-  - chmod +x /root/obsidian_cnc_bootstrap.sh
+  - cp obsidian_cnc_bootstrap.py /root/
+  - chmod +x /root/obsidian_cnc_bootstrap.py
   
-  # Substitute variables and run bootstrap
+  # Run Python bootstrap script
   - source /opt/obsidian-env
-  - envsubst < /root/obsidian_cnc_bootstrap.sh > /root/cnc_bootstrap_final.sh
-  - chmod +x /root/cnc_bootstrap_final.sh
-  - nohup /root/cnc_bootstrap_final.sh > /var/log/obsidian-bootstrap.log 2>&1 &
+  - python3 /root/obsidian_cnc_bootstrap.py > /var/log/obsidian-bootstrap.log 2>&1 &
   
   # Set up log rotation for bootstrap log
   - |
@@ -722,5 +720,7 @@ def main():
         sys.exit(1)
 
 
+if __name__ == "__main__":
+    main()
 if __name__ == "__main__":
     main()

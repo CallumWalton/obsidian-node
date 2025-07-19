@@ -331,10 +331,10 @@ If automated deployment fails, you can run the bootstrap scripts manually:
 
 ```bash
 # For C&C server
-curl -fsSL https://raw.githubusercontent.com/CallumWalton/obsidian-node/main/obsidian_cnc_bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/CallumWalton/obsidian-node/main/obsidian_cnc_bootstrap.py | python3
 
-# For client nodes
-curl -fsSL https://raw.githubusercontent.com/CallumWalton/obsidian-node/main/obsidian_bootstrap.sh | sudo bash
+# For client nodes  
+curl -fsSL https://raw.githubusercontent.com/CallumWalton/obsidian-node/main/obsidian_bootstrap.py | python3
 ```
 
 ## Cost Estimation (Hetzner Cloud)
