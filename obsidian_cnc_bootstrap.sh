@@ -14,7 +14,9 @@ set -euo pipefail
 
 # Detect execution environment
 readonly IS_HEADLESS="${HEADLESS:-true}"
-readonly IS_INTERACTIVE=$([ -t 1 ] && [ -t 2 ] && echo "true" || echo "false")
+local is_interactive
+is_interactive=$([ -t 1 ] && [ -t 2 ] && echo "true" || echo "false")
+readonly IS_INTERACTIVE="$is_interactive"
 
 # Logging setup - handle headless vs interactive differently
 readonly LOG_FILE="/var/log/obsidian-cnc-bootstrap.log"
@@ -55,7 +57,6 @@ readonly GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-$(openssl rand -base6
 readonly MAX_RETRIES=5
 readonly INITIAL_RETRY_DELAY=10
 readonly HEALTH_CHECK_TIMEOUT=120
-readonly SERVICE_START_TIMEOUT=180
 
 # Auto-detect network interface with better fallbacks
 detect_network_interface() {
@@ -77,13 +78,16 @@ detect_network_interface() {
     echo "$interface"
 }
 
-readonly NETWORK_INTERFACE=$(detect_network_interface)
+local network_interface
+network_interface=$(detect_network_interface)
+readonly NETWORK_INTERFACE="$network_interface"
 
 # Enhanced logging functions without colors in headless mode
 log_with_timestamp() {
     local level="$1"
     shift
-    local timestamp="[$(date '+%Y-%m-%d %H:%M:%S UTC')]"
+    local timestamp
+    timestamp="[$(date '+%Y-%m-%d %H:%M:%S UTC')]"
     
     if [[ "$IS_INTERACTIVE" == "true" && "$IS_HEADLESS" != "true" ]]; then
         # Interactive mode with colors
@@ -417,7 +421,8 @@ install_wireguard_server_impl() {
         info "Generated WireGuard server keys"
     fi
 
-    local server_private_key=$(cat server_private.key)
+    local server_private_key
+    server_private_key=$(cat server_private.key)
 
     # Create server configuration with detected interface
     cat > /etc/wireguard/wg0.conf << EOF
@@ -503,19 +508,23 @@ EOF
 
     chmod +x "$OBSIDIAN_CNC_HOME/scripts/add_wireguard_client.sh"
 
+    # Create default WireGuard client configurations
+    create_default_wireguard_clients
+
     systemctl enable wg-quick@wg0.service
     systemctl start wg-quick@wg0.service
     
     wait_for_service "wg-quick@wg0" $HEALTH_CHECK_TIMEOUT
 
-    echo "$(cat server_public.key)" > "$OBSIDIAN_CNC_HOME/wireguard_server_public_key"
+    cat server_public.key > "$OBSIDIAN_CNC_HOME/wireguard_server_public_key"
 }
 
 # Create default WireGuard client configurations
 create_default_wireguard_clients() {
     info "Creating default WireGuard client credentials in /root/wireguard-credentials/"
     
-    local server_public_key=$(cat /etc/wireguard/server_public.key)
+    local server_public_key
+    server_public_key=$(cat /etc/wireguard/server_public.key)
     local credentials_dir="/root/wireguard-credentials"
     
     # Default clients to create
@@ -567,8 +576,10 @@ EOF
         wg genkey > "${client_name}_private.key"
         wg pubkey < "${client_name}_private.key" > "${client_name}_public.key"
         
-        local client_private_key=$(cat "${client_name}_private.key")
-        local client_public_key=$(cat "${client_name}_public.key")
+        local client_private_key
+        local client_public_key
+        client_private_key=$(cat "${client_name}_private.key")
+        client_public_key=$(cat "${client_name}_public.key")
         
         # Create client configuration
         cat > "${client_name}.conf" << EOC
