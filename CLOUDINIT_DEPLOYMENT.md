@@ -52,29 +52,25 @@ tail -f /var/log/cloud-init-output.log
 
 ### 2. Client Node Deployment
 
-1. **Get C&C server information** from the deployed server:
+1. **Wait for C&C server deployment completion** (~15-20 minutes)
+
+2. **Verify C&C server is accessible**:
 ```bash
-# SSH to C&C server
-ssh obsidian@<cnc-server-ip>
-
-# Get WireGuard public key
-sudo cat /opt/obsidian-cnc/wireguard_server_public_key
-
-# Generate cluster join token (if not set)
-sudo uuidgen | sudo tee /opt/obsidian-cnc/cluster_join_token
+# Test C&C server accessibility
+curl -I https://cnc.obsidian.example.com
 ```
 
-2. **Set client environment variables**:
+3. **Set client environment variables** (server public key will be auto-retrieved):
 ```bash
 GITHUB_PAT_TOKEN=ghp_your_personal_access_token_here
 CNC_DOMAIN=cnc.obsidian.example.com
-CNC_PUBLIC_KEY=<wireguard-server-public-key>
 NODE_VPN_IP=10.0.0.2
 CLUSTER_JOIN_TOKEN=<cluster-join-token>
 NODE_NAME=game-node-01
+# Note: CNC_PUBLIC_KEY is no longer needed - auto-retrieved from server
 ```
 
-3. **Deploy client** using `client-cloudinit.yml`:
+4. **Deploy client** using `client-cloudinit.yml`:
 ```bash
 # Hetzner Cloud CLI example
 hcloud server create \
@@ -86,6 +82,11 @@ hcloud server create \
   --label environment=production \
   --label role=game-node
 ```
+
+The client will automatically:
+- Retrieve the WireGuard server public key from the C&C server
+- Configure and establish VPN connection
+- Register with the cluster management system
 
 ## Hetzner Cloud Deployment Examples
 

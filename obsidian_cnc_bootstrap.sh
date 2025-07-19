@@ -1,70 +1,252 @@
 #!/usr/bin/env bash
 #
 # Obsidian Command & Control (C&C) Bootstrap Script
-# Prepares Ubuntu 24.04 LTS VM for centralized Obsidian platform management
+# Optimized for headless deployment on Hetzner Cloud
 # 
-# This script is idempotent and can be run multiple times safely
-# All placeholders use ALL-CAPS format for envsubst processing
+# This script is fully autonomous with self-error correction
+# All operations are logged to /var/log/obsidian-cnc-bootstrap.log
 #
 # Author: Obsidian Platform Team
-# Version: 1.0
-# Date: 2025-07-19
+# Version: 2.1
+# Date: 2025-01-19
 
 set -euo pipefail
 
-# Color codes for output
-readonly RED='\033[0;31m'
-readonly YELLOW='\033[1;33m'
-readonly GREEN='\033[0;32m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m' # No Color
+# Detect execution environment
+readonly IS_HEADLESS="${HEADLESS:-true}"
+readonly IS_INTERACTIVE=$([ -t 1 ] && [ -t 2 ] && echo "true" || echo "false")
+
+# Logging setup - handle headless vs interactive differently
+readonly LOG_FILE="/var/log/obsidian-cnc-bootstrap.log"
+readonly ERROR_LOG_FILE="/var/log/obsidian-cnc-bootstrap-errors.log"
+readonly HEADLESS_LOG_FILE="/root/obsidian-cnc-bootstrap.log"
+readonly HEADLESS_ERROR_LOG_FILE="/root/obsidian-cnc-bootstrap-errors.log"
+
+# Ensure log files exist and are writable
+mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "/root"
+touch "$LOG_FILE" "$ERROR_LOG_FILE" "$HEADLESS_LOG_FILE" "$HEADLESS_ERROR_LOG_FILE"
+chmod 644 "$LOG_FILE" "$ERROR_LOG_FILE"
+chmod 600 "$HEADLESS_LOG_FILE" "$HEADLESS_ERROR_LOG_FILE"
+
+# Smart output redirection based on environment
+if [[ "$IS_HEADLESS" == "true" || "$IS_INTERACTIVE" == "false" ]]; then
+    # Headless mode - direct to files only (both system and root locations)
+    exec 1> >(tee -a "$LOG_FILE" >> "$HEADLESS_LOG_FILE")
+    exec 2> >(tee -a "$ERROR_LOG_FILE" >> "$HEADLESS_ERROR_LOG_FILE")
+else
+    # Interactive mode - use tee for dual output
+    exec 1> >(tee -a "$LOG_FILE")
+    exec 2> >(tee -a "$ERROR_LOG_FILE" >&2)
+fi
 
 # Configuration variables (to be substituted by automation)
 readonly OBSIDIAN_CNC_HOME="/opt/obsidian-cnc"
-readonly DOMAIN="${DOMAIN}"
-readonly EMAIL="${EMAIL}"
-readonly DB_PASSWORD="${DB_PASSWORD}"
-readonly KEYCLOAK_ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD}"
+readonly DOMAIN="${DOMAIN:-localhost}"
+readonly EMAIL="${EMAIL:-admin@localhost}"
+readonly DB_PASSWORD="${DB_PASSWORD:-$(openssl rand -base64 32)}"
+readonly KEYCLOAK_ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD:-$(openssl rand -base64 32)}"
 readonly WG_NETWORK_CIDR="${WG_NETWORK_CIDR:-10.0.0.0/24}"
 readonly WG_SERVER_IP="${WG_SERVER_IP:-10.0.0.1}"
 readonly WG_PORT="${WG_PORT:-51820}"
-readonly GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}"
-readonly S3_BUCKET="${S3_BUCKET}"
-readonly S3_ACCESS_KEY="${S3_ACCESS_KEY}"
-readonly S3_SECRET_KEY="${S3_SECRET_KEY}"
-readonly S3_ENDPOINT="${S3_ENDPOINT}"
-readonly ADMIN_EMAIL="${ADMIN_EMAIL}"
-readonly SMTP_HOST="${SMTP_HOST}"
-readonly SMTP_PORT="${SMTP_PORT:-587}"
-readonly SMTP_USER="${SMTP_USER}"
-readonly SMTP_PASSWORD="${SMTP_PASSWORD}"
+readonly GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-$(openssl rand -base64 32)}"
 
-# Logging functions
+# Enhanced self-correction parameters
+readonly MAX_RETRIES=5
+readonly INITIAL_RETRY_DELAY=10
+readonly HEALTH_CHECK_TIMEOUT=120
+readonly SERVICE_START_TIMEOUT=180
+
+# Auto-detect network interface with better fallbacks
+detect_network_interface() {
+    local interface
+    
+    # Try multiple methods to detect primary interface
+    interface=$(ip route | grep '^default' | head -n1 | awk '{print $5}' 2>/dev/null || echo "")
+    
+    if [[ -z "$interface" ]]; then
+        # Fallback: find first active interface (excluding loopback)
+        interface=$(ip link show | grep -E '^[0-9]+: (eth|ens|enp)' | head -n1 | cut -d: -f2 | tr -d ' ' || echo "")
+    fi
+    
+    if [[ -z "$interface" ]]; then
+        # Final fallback for cloud providers
+        interface="eth0"
+    fi
+    
+    echo "$interface"
+}
+
+readonly NETWORK_INTERFACE=$(detect_network_interface)
+
+# Enhanced logging functions without colors in headless mode
+log_with_timestamp() {
+    local level="$1"
+    shift
+    local timestamp="[$(date '+%Y-%m-%d %H:%M:%S UTC')]"
+    
+    if [[ "$IS_INTERACTIVE" == "true" && "$IS_HEADLESS" != "true" ]]; then
+        # Interactive mode with colors
+        case "$level" in
+            "INFO") echo -e "\033[0;32m${timestamp} [INFO]\033[0m $*" ;;
+            "WARN") echo -e "\033[1;33m${timestamp} [WARN]\033[0m $*" ;;
+            "ERROR") echo -e "\033[0;31m${timestamp} [ERROR]\033[0m $*" ;;
+            "DEBUG") echo -e "\033[0;34m${timestamp} [DEBUG]\033[0m $*" ;;
+            *) echo "${timestamp} [$level] $*" ;;
+        esac
+    else
+        # Headless mode without colors
+        echo "${timestamp} [$level] $*"
+    fi
+}
+
 info() {
-    echo -e "${GREEN}[INFO]${NC} $*" >&2
+    log_with_timestamp "INFO" "$*"
 }
 
 warn() {
-    echo -e "${YELLOW}[WARN]${NC} $*" >&2
+    log_with_timestamp "WARN" "$*"
 }
 
 error() {
-    echo -e "${RED}[ERROR]${NC} $*" >&2
+    log_with_timestamp "ERROR" "$*"
 }
 
 debug() {
-    echo -e "${BLUE}[DEBUG]${NC} $*" >&2
+    log_with_timestamp "DEBUG" "$*"
 }
 
-# Helper function to run commands as specific user
-run_as() {
-    local user="$1"
-    shift
-    if [[ $EUID -eq 0 ]]; then
-        sudo -u "$user" "$@"
-    else
-        "$@"
-    fi
+# Enhanced self-error correction with exponential backoff
+retry_with_backoff() {
+    local max_attempts="$1"
+    local initial_delay="$2"
+    local description="$3"
+    shift 3
+    local attempt=1
+    local delay="$initial_delay"
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        info "Attempting $description (attempt $attempt/$max_attempts)"
+        
+        # Create a subshell to contain any errors
+        if (set -e; "$@"); then
+            info "$description completed successfully"
+            return 0
+        fi
+        
+        local exit_code=$?
+        
+        if [[ $attempt -eq $max_attempts ]]; then
+            error "$description failed after $max_attempts attempts (exit code: $exit_code)"
+            return 1
+        fi
+        
+        warn "$description failed (exit code: $exit_code), retrying in ${delay}s..."
+        sleep "$delay"
+        ((attempt++))
+        
+        # Exponential backoff with jitter
+        delay=$((delay * 2 + RANDOM % 10))
+    done
+}
+
+# Robust service waiting with better error handling
+wait_for_service() {
+    local service="$1"
+    local timeout="${2:-$HEALTH_CHECK_TIMEOUT}"
+    local elapsed=0
+    local check_interval=5
+    
+    info "Waiting for $service to become ready (timeout: ${timeout}s)"
+    
+    while [[ $elapsed -lt $timeout ]]; do
+        # Check if service exists first
+        if ! systemctl list-unit-files --type=service | grep -q "^${service}\.service"; then
+            error "Service $service does not exist"
+            return 1
+        fi
+        
+        # Check if service is active
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            info "$service is ready (took ${elapsed}s)"
+            return 0
+        fi
+        
+        # Check if service failed
+        if systemctl is-failed --quiet "$service" 2>/dev/null; then
+            error "$service has failed. Status:"
+            systemctl status "$service" --no-pager -l || true
+            return 1
+        fi
+        
+        sleep $check_interval
+        elapsed=$((elapsed + check_interval))
+        
+        # Progress indicator for long waits
+        if [[ $((elapsed % 30)) -eq 0 ]]; then
+            info "Still waiting for $service... (${elapsed}/${timeout}s)"
+        fi
+    done
+    
+    error "$service failed to start within ${timeout}s"
+    systemctl status "$service" --no-pager -l || true
+    return 1
+}
+
+# Enhanced container waiting with health checks
+wait_for_container() {
+    local container="$1"
+    local timeout="${2:-$HEALTH_CHECK_TIMEOUT}"
+    local elapsed=0
+    local check_interval=5
+    
+    info "Waiting for container $container to be ready (timeout: ${timeout}s)"
+    
+    while [[ $elapsed -lt $timeout ]]; do
+        # Check if container is running
+        if docker ps --filter "name=$container" --filter "status=running" --format "{{.Names}}" | grep -q "^${container}$"; then
+            # If container has healthcheck, wait for it to be healthy
+            local health_status
+            health_status=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null || echo "none")
+            
+            if [[ "$health_status" == "healthy" ]] || [[ "$health_status" == "none" ]]; then
+                info "Container $container is ready (took ${elapsed}s)"
+                return 0
+            elif [[ "$health_status" == "unhealthy" ]]; then
+                error "Container $container is unhealthy"
+                docker logs --tail=20 "$container" || true
+                return 1
+            else
+                debug "Container $container health status: $health_status"
+            fi
+        else
+            # Check if container exists but is stopped/failed
+            if docker ps -a --filter "name=$container" --format "{{.Names}}" | grep -q "^${container}$"; then
+                local container_status
+                container_status=$(docker ps -a --filter "name=$container" --format "{{.Status}}")
+                debug "Container $container status: $container_status"
+                
+                # If container exited, it's failed
+                if [[ "$container_status" == *"Exited"* ]]; then
+                    error "Container $container has exited. Logs:"
+                    docker logs --tail=50 "$container" || true
+                    return 1
+                fi
+            fi
+        fi
+        
+        sleep $check_interval
+        elapsed=$((elapsed + check_interval))
+        
+        # Progress indicator
+        if [[ $((elapsed % 30)) -eq 0 ]]; then
+            info "Still waiting for container $container... (${elapsed}/${timeout}s)"
+        fi
+    done
+    
+    error "Container $container failed to start within ${timeout}s"
+    docker logs --tail=50 "$container" || true
+    return 1
 }
 
 # Check if running as root
@@ -75,54 +257,116 @@ check_root() {
     fi
 }
 
-# Create C&C directory structure
+# Enhanced directory setup with proper error handling
 setup_directories() {
-    info "Setting up Obsidian C&C directory structure"
-    install -d -m 755 "$OBSIDIAN_CNC_HOME"
-    install -d -m 755 "$OBSIDIAN_CNC_HOME/config"
-    install -d -m 755 "$OBSIDIAN_CNC_HOME/scripts"
-    install -d -m 755 "$OBSIDIAN_CNC_HOME/logs"
-    install -d -m 755 "$OBSIDIAN_CNC_HOME/certs"
-    install -d -m 755 "$OBSIDIAN_CNC_HOME/data"
-    install -d -m 700 "/etc/wireguard/clients"
-    install -d -m 755 "/var/lib/postgresql/data"
-    install -d -m 755 "/var/lib/grafana"
-    install -d -m 755 "/var/lib/prometheus"
+    info "Setting up Obsidian C&C directory structure with comprehensive pre-setup"
+    
+    local directories=(
+        "$OBSIDIAN_CNC_HOME:755"
+        "$OBSIDIAN_CNC_HOME/config:755"
+        "$OBSIDIAN_CNC_HOME/scripts:755"
+        "$OBSIDIAN_CNC_HOME/logs:755"
+        "$OBSIDIAN_CNC_HOME/certs:755"
+        "$OBSIDIAN_CNC_HOME/data:755"
+        "/etc/wireguard:700"
+        "/etc/wireguard/clients:700"
+        "/root/wireguard-credentials:700"
+        "/var/lib/postgresql/data:755"
+        "/var/lib/grafana:755"
+        "/var/lib/prometheus:755"
+        "$OBSIDIAN_CNC_HOME/config/grafana:755"
+        "$OBSIDIAN_CNC_HOME/config/grafana/datasources:755"
+        "$OBSIDIAN_CNC_HOME/config/grafana/dashboards:755"
+        "/var/www/html:755"
+        "/var/log/nginx:755"
+        "/var/log/postgresql:755"
+        "/etc/docker:755"
+        "/etc/cockpit:755"
+        "/etc/fail2ban:755"
+        "/etc/letsencrypt:755"
+    )
+    
+    for dir_spec in "${directories[@]}"; do
+        local dir_path="${dir_spec%:*}"
+        local dir_mode="${dir_spec#*:}"
+        
+        if ! install -d -m "$dir_mode" "$dir_path"; then
+            error "Failed to create directory: $dir_path"
+            return 1
+        fi
+        debug "Created directory: $dir_path (mode: $dir_mode)"
+    done
+    
+    info "All required directories created successfully"
 }
 
-# Update system packages
-update_system() {
+# Enhanced system update with better package management
+update_system_impl() {
     info "Updating system packages"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
+    
+    # Configure dpkg to handle conflicts automatically
+    local dpkg_options=(
+        "--force-confdef"
+        "--force-confold"
+    )
+    
+    # Set dpkg options
+    for option in "${dpkg_options[@]}"; do
+        echo "DPkg::Options \"$option\";" >> /etc/apt/apt.conf.d/90-obsidian-noninteractive
+    done
+    
+    # Additional APT configuration for headless operation
+    cat > /etc/apt/apt.conf.d/90-obsidian-noninteractive << 'EOF'
+APT::Get::Assume-Yes "true";
+APT::Get::force-yes "false";
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+DPkg::Options "--force-confdef";
+DPkg::Options "--force-confold";
+DPkg::Post-Invoke-Success { "rm -f /var/cache/apt/archives/*.deb"; };
+EOF
+    
+    # Fix any broken packages first
+    dpkg --configure -a || true
+    apt-get --fix-broken install -y || true
+    
+    # Update package lists with retry
+    local update_attempts=0
+    while [[ $update_attempts -lt 3 ]]; do
+        if apt-get update; then
+            break
+        fi
+        ((update_attempts++))
+        warn "Package list update failed, attempt $update_attempts/3"
+        sleep 10
+    done
+    
+    # Upgrade system
     apt-get upgrade -y
-    apt-get install -y \
-        curl \
-        wget \
-        gnupg \
-        lsb-release \
-        ca-certificates \
-        software-properties-common \
-        apt-transport-https \
-        jq \
-        envsubst \
-        nginx \
-        certbot \
-        python3-certbot-nginx \
-        postgresql \
-        postgresql-contrib \
-        redis-server \
-        fail2ban \
-        ufw \
-        htop \
-        iftop \
-        iotop \
-        tree
+    
+    # Install packages with error handling
+    local packages=(
+        curl wget gnupg lsb-release ca-certificates software-properties-common
+        apt-transport-https jq envsubst nginx certbot python3-certbot-nginx
+        postgresql postgresql-contrib redis-server fail2ban ufw
+        htop iftop iotop tree sqlite3 python3-flask python3-flask-httpauth
+        python3-pip flock
+    )
+    
+    apt-get install -y "${packages[@]}"
 }
 
-# Install Docker and Docker Compose
+# Enhanced Docker installation with self-correction
 install_docker() {
+    retry_with_backoff $MAX_RETRIES $INITIAL_RETRY_DELAY "Docker installation" install_docker_impl
+}
+
+install_docker_impl() {
     info "Installing Docker and Docker Compose"
+    
+    # Remove any existing Docker installations
+    apt-get remove -y docker docker-engine docker.io containerd runc || true
     
     # Add Docker's official GPG key
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
@@ -134,31 +378,36 @@ install_docker() {
     apt-get update
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
-    # Enable and start Docker
-    systemctl enable --now docker
-
-    # Add Docker log rotation
+    # Configure Docker daemon
     cat > /etc/docker/daemon.json << 'EOF'
 {
     "log-driver": "json-file",
     "log-opts": {
         "max-size": "10m",
         "max-file": "3"
-    }
+    },
+    "storage-driver": "overlay2",
+    "live-restore": true
 }
 EOF
 
-    systemctl restart docker
+    # Enable and start Docker
+    systemctl enable docker
+    systemctl start docker
+    
+    wait_for_service "docker" $HEALTH_CHECK_TIMEOUT
 }
 
-# Install and configure WireGuard Server
+# Enhanced WireGuard installation with network interface detection
 install_wireguard_server() {
-    info "Installing and configuring WireGuard VPN Server"
+    retry_with_backoff $MAX_RETRIES $INITIAL_RETRY_DELAY "WireGuard server installation" install_wireguard_server_impl
+}
+
+install_wireguard_server_impl() {
+    info "Installing WireGuard VPN Server (interface: $NETWORK_INTERFACE)"
     
-    # Install WireGuard
     apt-get install -y wireguard wireguard-tools qrencode
 
-    # Generate server keys
     cd /etc/wireguard
     umask 077
     
@@ -169,9 +418,8 @@ install_wireguard_server() {
     fi
 
     local server_private_key=$(cat server_private.key)
-    local server_public_key=$(cat server_public.key)
 
-    # Create server configuration
+    # Create server configuration with detected interface
     cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 PrivateKey = ${server_private_key}
@@ -179,14 +427,14 @@ Address = ${WG_SERVER_IP}/24
 ListenPort = ${WG_PORT}
 SaveConfig = false
 
-# Enable IP forwarding and NAT
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; ip route add ${WG_NETWORK_CIDR} dev wg0
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; ip route del ${WG_NETWORK_CIDR} dev wg0
+# Enable IP forwarding and NAT for detected interface
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${NETWORK_INTERFACE} -j MASQUERADE; ip route add ${WG_NETWORK_CIDR} dev wg0
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${NETWORK_INTERFACE} -j MASQUERADE; ip route del ${WG_NETWORK_CIDR} dev wg0
 
 # Clients will be added here dynamically
 EOF
 
-    # Enable IP forwarding
+    # Enable IP forwarding permanently
     echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
     echo 'net.ipv6.conf.all.forwarding = 1' >> /etc/sysctl.conf
     sysctl -p
@@ -255,13 +503,142 @@ EOF
 
     chmod +x "$OBSIDIAN_CNC_HOME/scripts/add_wireguard_client.sh"
 
-    # Enable WireGuard service
     systemctl enable wg-quick@wg0.service
     systemctl start wg-quick@wg0.service
+    
+    wait_for_service "wg-quick@wg0" $HEALTH_CHECK_TIMEOUT
 
-    # Store server public key for distribution
-    echo "$server_public_key" > "$OBSIDIAN_CNC_HOME/wireguard_server_public_key"
-    info "WireGuard server configured - Public key saved for client distribution"
+    echo "$(cat server_public.key)" > "$OBSIDIAN_CNC_HOME/wireguard_server_public_key"
+}
+
+# Create default WireGuard client configurations
+create_default_wireguard_clients() {
+    info "Creating default WireGuard client credentials in /root/wireguard-credentials/"
+    
+    local server_public_key=$(cat /etc/wireguard/server_public.key)
+    local credentials_dir="/root/wireguard-credentials"
+    
+    # Default clients to create
+    local default_clients=(
+        "admin:10.0.0.10"
+        "laptop:10.0.0.11"
+        "mobile:10.0.0.12"
+        "backup:10.0.0.13"
+    )
+    
+    # Create README file
+    cat > "$credentials_dir/README.md" << EOF
+# Default WireGuard Client Credentials
+
+This directory contains pre-generated WireGuard client configurations for immediate use.
+
+## Available Clients:
+- **admin** (10.0.0.10) - Primary administration access
+- **laptop** (10.0.0.11) - Laptop/workstation access  
+- **mobile** (10.0.0.12) - Mobile device access
+- **backup** (10.0.0.13) - Backup/emergency access
+
+## Usage:
+1. Copy the .conf file to your WireGuard client
+2. Import the configuration
+3. Connect to the VPN
+
+## QR Codes:
+Use the .png files to scan QR codes with mobile devices.
+
+## Security Notes:
+- These are default credentials for initial setup
+- Change or regenerate these credentials in production
+- Monitor access logs regularly
+
+Generated on: $(date)
+Server: ${DOMAIN}
+Server Public Key: ${server_public_key}
+EOF
+    
+    for client_info in "${default_clients[@]}"; do
+        local client_name="${client_info%%:*}"
+        local client_ip="${client_info##*:}"
+        
+        info "Creating default client: $client_name ($client_ip)"
+        
+        # Generate client keys
+        cd "$credentials_dir"
+        wg genkey > "${client_name}_private.key"
+        wg pubkey < "${client_name}_private.key" > "${client_name}_public.key"
+        
+        local client_private_key=$(cat "${client_name}_private.key")
+        local client_public_key=$(cat "${client_name}_public.key")
+        
+        # Create client configuration
+        cat > "${client_name}.conf" << EOC
+[Interface]
+PrivateKey = ${client_private_key}
+Address = ${client_ip}/32
+DNS = ${WG_SERVER_IP}
+
+[Peer]
+PublicKey = ${server_public_key}
+Endpoint = ${DOMAIN}:${WG_PORT}
+AllowedIPs = 0.0.0.0/1, 128.0.0.0/1, ::/1, 8000::/1
+PersistentKeepalive = 25
+EOC
+        
+        # Generate QR code for mobile setup
+        qrencode -t PNG -o "${client_name}_qr.png" < "${client_name}.conf"
+        
+        # Add client to server configuration
+        cat >> /etc/wireguard/wg0.conf << EOC
+
+# Default Client: ${client_name}
+[Peer]
+PublicKey = ${client_public_key}
+AllowedIPs = ${client_ip}/32
+EOC
+        
+        # Create individual client info file
+        cat > "${client_name}_info.txt" << EOC
+Client Name: ${client_name}
+IP Address: ${client_ip}
+Private Key: ${client_private_key}
+Public Key: ${client_public_key}
+Server Endpoint: ${DOMAIN}:${WG_PORT}
+Server Public Key: ${server_public_key}
+Created: $(date)
+
+Configuration File: ${client_name}.conf
+QR Code: ${client_name}_qr.png
+EOC
+        
+        info "Created default client $client_name with IP $client_ip"
+    done
+    
+    # Set proper permissions
+    chmod -R 600 "$credentials_dir"/*
+    chmod 700 "$credentials_dir"
+    
+    # Create summary file for automated provisioning
+    cat > "$credentials_dir/server_info.txt" << EOF
+WireGuard Server Information
+============================
+Generated: $(date)
+Server Domain: ${DOMAIN}
+Server Port: ${WG_PORT}
+Server Public Key: ${server_public_key}
+Network CIDR: ${WG_NETWORK_CIDR}
+Server VPN IP: ${WG_SERVER_IP}
+
+Client IP Range: 10.0.0.10-13 (default clients)
+Next Available IP: 10.0.0.14
+
+For automated client provisioning, use:
+- Server Public Key: ${server_public_key}
+- Server Endpoint: ${DOMAIN}:${WG_PORT}
+- DNS Server: ${WG_SERVER_IP}
+EOF
+    
+    info "Default WireGuard credentials created in $credentials_dir"
+    info "Server public key for client provisioning: ${server_public_key}"
 }
 
 # Install and configure Cockpit Management Server
@@ -453,11 +830,14 @@ EOF
     systemctl enable --now cockpit.socket
 }
 
-# Install and configure Keycloak SSO
+# Enhanced Keycloak installation
 install_keycloak() {
+    retry_with_backoff $MAX_RETRIES $INITIAL_RETRY_DELAY "Keycloak installation" install_keycloak_impl
+}
+
+install_keycloak_impl() {
     info "Installing and configuring Keycloak SSO"
     
-    # Create Keycloak Docker Compose configuration
     cat > "$OBSIDIAN_CNC_HOME/docker-compose.keycloak.yml" << EOF
 version: '3.8'
 
@@ -474,6 +854,11 @@ services:
     networks:
       - keycloak-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   keycloak:
     image: quay.io/keycloak/keycloak:latest
@@ -495,6 +880,11 @@ services:
     networks:
       - keycloak-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/auth/realms/master || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   keycloak_db_data:
@@ -504,16 +894,18 @@ networks:
     driver: bridge
 EOF
 
-    # Start Keycloak
     cd "$OBSIDIAN_CNC_HOME"
     docker compose -f docker-compose.keycloak.yml up -d
-
-    info "Keycloak started - Available at http://localhost:8080"
-    info "Admin credentials: admin / ${KEYCLOAK_ADMIN_PASSWORD}"
+    
+    wait_for_container "keycloak" $HEALTH_CHECK_TIMEOUT
 }
 
-# Install monitoring stack (Prometheus + Grafana)
+# Install and configure monitoring stack (Prometheus + Grafana)
 install_monitoring() {
+    retry_with_backoff $MAX_RETRIES $INITIAL_RETRY_DELAY "monitoring stack installation" install_monitoring_impl
+}
+
+install_monitoring_impl() {
     info "Installing monitoring stack (Prometheus + Grafana)"
     
     # Create Prometheus configuration
@@ -575,6 +967,11 @@ services:
     networks:
       - monitoring
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   grafana:
     image: grafana/grafana:latest
@@ -584,12 +981,18 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
     volumes:
       - grafana_data:/var/lib/grafana
       - ./config/grafana:/etc/grafana/provisioning
     networks:
       - monitoring
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   node-exporter:
     image: prom/node-exporter:latest
@@ -633,20 +1036,24 @@ datasources:
     isDefault: true
 EOF
 
-    # Start monitoring stack
     cd "$OBSIDIAN_CNC_HOME"
     docker compose -f docker-compose.monitoring.yml up -d
-
-    info "Monitoring stack started:"
-    info "- Prometheus: http://localhost:9090"
-    info "- Grafana: http://localhost:3000 (admin / ${GRAFANA_ADMIN_PASSWORD})"
+    
+    wait_for_container "prometheus" $HEALTH_CHECK_TIMEOUT
+    wait_for_container "grafana" $HEALTH_CHECK_TIMEOUT
 }
 
-# Configure Nginx reverse proxy with SSL
+# Enhanced nginx configuration with self-correction
 configure_nginx() {
+    retry_with_backoff $MAX_RETRIES $INITIAL_RETRY_DELAY "Nginx configuration" configure_nginx_impl
+}
+
+configure_nginx_impl() {
     info "Configuring Nginx reverse proxy with SSL"
     
-    # Remove default configuration
+    # Stop nginx if running to avoid conflicts
+    systemctl stop nginx || true
+    
     rm -f /etc/nginx/sites-enabled/default
 
     # Create Obsidian C&C configuration
@@ -723,18 +1130,35 @@ EOF
     # Enable site
     ln -sf /etc/nginx/sites-available/obsidian-cnc /etc/nginx/sites-enabled/
 
-    # Test and reload Nginx
-    nginx -t && systemctl reload nginx
+    # Test configuration before starting
+    nginx -t
+    systemctl start nginx
+    wait_for_service "nginx" $HEALTH_CHECK_TIMEOUT
 
-    # Obtain SSL certificate
+    # Obtain SSL certificate with retry logic
     info "Obtaining SSL certificate with Let's Encrypt"
-    certbot --nginx -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive
-
-    info "Nginx configured with SSL for domain: $DOMAIN"
+    local cert_attempts=0
+    while [[ $cert_attempts -lt 3 ]]; do
+        if certbot --nginx -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive; then
+            info "SSL certificate obtained successfully"
+            break
+        fi
+        ((cert_attempts++))
+        if [[ $cert_attempts -eq 3 ]]; then
+            warn "Failed to obtain SSL certificate after 3 attempts, continuing without SSL"
+        else
+            warn "SSL certificate attempt $cert_attempts failed, retrying in 30s..."
+            sleep 30
+        fi
+    done
 }
 
-# Configure security (firewall, fail2ban)
+# Simplified security configuration
 configure_security() {
+    retry_with_backoff $MAX_RETRIES $INITIAL_RETRY_DELAY "security configuration" configure_security_impl
+}
+
+configure_security_impl() {
     info "Configuring security (firewall and fail2ban)"
     
     # Configure UFW firewall
@@ -748,7 +1172,6 @@ configure_security() {
     ufw allow 443/tcp comment 'HTTPS'
     ufw allow "$WG_PORT/udp" comment 'WireGuard VPN'
     
-    # Enable UFW
     ufw --force enable
 
     # Configure fail2ban
@@ -780,267 +1203,19 @@ logpath = /var/log/auth.log
 maxretry = 3
 EOF
 
-    systemctl enable --now fail2ban
-    
-    info "Security configuration completed"
+    systemctl enable fail2ban
+    systemctl start fail2ban
+    wait_for_service "fail2ban" $HEALTH_CHECK_TIMEOUT
 }
 
-# Setup backup system
-setup_backups() {
-    info "Setting up backup system"
-    
-    # Install restic
-    apt-get install -y restic
+# Remove backup-related functions (S3 dependencies removed)
 
-    # Create backup environment
-    cat > /etc/restic/env.d/cnc-backup.env << EOF
-RESTIC_REPOSITORY=s3:${S3_ENDPOINT}/${S3_BUCKET}-cnc
-RESTIC_PASSWORD_FILE=/etc/restic/cnc-password
-AWS_ACCESS_KEY_ID=${S3_ACCESS_KEY}
-AWS_SECRET_ACCESS_KEY=${S3_SECRET_KEY}
-EOF
-
-    # Generate backup password
-    openssl rand -base64 32 > /etc/restic/cnc-password
-    chmod 600 /etc/restic/cnc-password
-
-    # Create backup script
-    cat > "$OBSIDIAN_CNC_HOME/scripts/backup_cnc.sh" << 'EOF'
-#!/bin/bash
-set -euo pipefail
-
-source /etc/restic/env.d/cnc-backup.env
-
-# Initialize repository if it doesn't exist
-if ! restic snapshots > /dev/null 2>&1; then
-    restic init
-fi
-
-# Stop services for consistent backup
-docker compose -f /opt/obsidian-cnc/docker-compose.keycloak.yml stop
-docker compose -f /opt/obsidian-cnc/docker-compose.monitoring.yml stop
-
-# Run backup
-restic backup \
-    --tag obsidian-cnc \
-    --host "$(hostname)" \
-    /opt/obsidian-cnc \
-    /etc/nginx/sites-available \
-    /etc/wireguard \
-    /var/lib/docker/volumes
-
-# Restart services
-docker compose -f /opt/obsidian-cnc/docker-compose.keycloak.yml start
-docker compose -f /opt/obsidian-cnc/docker-compose.monitoring.yml start
-
-# Cleanup old snapshots
-restic forget --prune \
-    --keep-daily 14 \
-    --keep-weekly 8 \
-    --keep-monthly 12 \
-    --host "$(hostname)"
-EOF
-
-    chmod +x "$OBSIDIAN_CNC_HOME/scripts/backup_cnc.sh"
-
-    # Create systemd backup service
-    cat > /etc/systemd/system/obsidian-cnc-backup.service << EOF
-[Unit]
-Description=Obsidian C&C Backup
-After=docker.service
-
-[Service]
-Type=oneshot
-ExecStart=$OBSIDIAN_CNC_HOME/scripts/backup_cnc.sh
-User=root
-StandardOutput=journal
-StandardError=journal
-EOF
-
-    # Create backup timer - daily at 01:00 UTC
-    cat > /etc/systemd/system/obsidian-cnc-backup.timer << 'EOF'
-[Unit]
-Description=Daily Obsidian C&C Backup
-Requires=obsidian-cnc-backup.service
-
-[Timer]
-OnCalendar=01:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable obsidian-cnc-backup.timer
-    systemctl start obsidian-cnc-backup.timer
-}
-
-# Create management scripts
-create_management_scripts() {
-    info "Creating management and utility scripts"
-    
-    # Node management script
-    cat > "$OBSIDIAN_CNC_HOME/scripts/manage_nodes.sh" << 'EOF'
-#!/bin/bash
-# Obsidian Node Management Script
-
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DB_PATH="/opt/obsidian-cnc/data/nodes.db"
-
-show_help() {
-    echo "Obsidian Node Management"
-    echo ""
-    echo "Usage: $0 [command] [options]"
-    echo ""
-    echo "Commands:"
-    echo "  list                    List all registered nodes"
-    echo "  add-vpn <name> <ip>    Add WireGuard VPN client"
-    echo "  remove <hostname>       Remove node from cluster"
-    echo "  status                  Show cluster status"
-    echo "  health                  Check health of all nodes"
-    echo ""
-}
-
-list_nodes() {
-    echo "Registered Obsidian Nodes:"
-    echo "=========================="
-    sqlite3 "$DB_PATH" "SELECT hostname, wireguard_ip, status, created_at FROM nodes ORDER BY created_at DESC;" | \
-    while IFS='|' read -r hostname ip status created; do
-        printf "%-20s %-15s %-10s %s\n" "$hostname" "$ip" "$status" "$created"
-    done
-}
-
-add_vpn_client() {
-    local name="$1"
-    local ip="$2"
-    "$SCRIPT_DIR/add_wireguard_client.sh" "$name" "$ip"
-}
-
-cluster_status() {
-    echo "Obsidian Cluster Status:"
-    echo "======================="
-    echo "WireGuard Server: $(systemctl is-active wg-quick@wg0)"
-    echo "Cockpit: $(systemctl is-active cockpit.socket)"
-    echo "Cluster API: $(systemctl is-active obsidian-cluster-api)"
-    echo "Keycloak: $(docker ps --format 'table {{.Names}}\t{{.Status}}' | grep keycloak || echo 'Not running')"
-    echo "Monitoring: $(docker ps --format 'table {{.Names}}\t{{.Status}}' | grep -E '(prometheus|grafana)' || echo 'Not running')"
-}
-
-case "${1:-}" in
-    list)
-        list_nodes
-        ;;
-    add-vpn)
-        if [[ $# -ne 3 ]]; then
-            echo "Usage: $0 add-vpn <name> <ip>"
-            exit 1
-        fi
-        add_vpn_client "$2" "$3"
-        ;;
-    status)
-        cluster_status
-        ;;
-    help|--help|-h)
-        show_help
-        ;;
-    *)
-        show_help
-        exit 1
-        ;;
-esac
-EOF
-
-    chmod +x "$OBSIDIAN_CNC_HOME/scripts/manage_nodes.sh"
-
-    # Health check script
-    cat > "$OBSIDIAN_CNC_HOME/scripts/cnc_health_check.sh" << 'EOF'
-#!/bin/bash
-# Obsidian C&C Health Check Script
-
-set -euo pipefail
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-check_service() {
-    local service="$1"
-    if systemctl is-active --quiet "$service"; then
-        echo -e "${GREEN}✓${NC} $service is running"
-        return 0
-    else
-        echo -e "${RED}✗${NC} $service is not running"
-        return 1
-    fi
-}
-
-check_container() {
-    local container="$1"
-    if docker ps | grep -q "$container"; then
-        echo -e "${GREEN}✓${NC} $container container is running"
-        return 0
-    else
-        echo -e "${RED}✗${NC} $container container is not running"
-        return 1
-    fi
-}
-
-echo "=== Obsidian C&C Health Check ==="
-echo "Timestamp: $(date)"
-echo "Hostname: $(hostname)"
-echo
-
-# Check system services
-echo "--- System Services ---"
-check_service "nginx"
-check_service "postgresql"
-check_service "redis-server"
-check_service "wg-quick@wg0"
-check_service "cockpit.socket"
-check_service "obsidian-cluster-api"
-check_service "docker"
-
-echo
-
-# Check containers
-echo "--- Docker Containers ---"
-check_container "keycloak"
-check_container "prometheus"
-check_container "grafana"
-check_container "node-exporter"
-
-echo
-
-# Check ports
-echo "--- Network Ports ---"
-ss -tuln | grep -E ':(80|443|9090|8080|3000|9090|51820) ' || echo -e "${YELLOW}!${NC} Some ports may not be listening"
-
-echo
-
-# Check disk space
-echo "--- Disk Usage ---"
-df -h / | awk 'NR==2 {
-    use = $5; 
-    gsub(/%/, "", use); 
-    if (use > 80) 
-        printf "\033[0;31m✗\033[0m Root filesystem is %s full\n", $5; 
-    else 
-        printf "\033[0;32m✓\033[0m Root filesystem is %s full\n", $5
-}'
-
-echo
-echo "=== Health Check Complete ==="
-EOF
-
-    chmod +x "$OBSIDIAN_CNC_HOME/scripts/cnc_health_check.sh"
-}
-
-# Finalize C&C setup
+# Enhanced finalization with comprehensive health check
 finalize_setup() {
+    retry_with_backoff $MAX_RETRIES $INITIAL_RETRY_DELAY "finalization" finalize_setup_impl
+}
+
+finalize_setup_impl() {
     info "Finalizing C&C setup"
     
     # Create obsidian-cnc user
@@ -1049,12 +1224,11 @@ finalize_setup() {
         usermod -a -G docker obsidian-cnc
     fi
     
-    # Set proper permissions
     chown -R obsidian-cnc:obsidian-cnc "$OBSIDIAN_CNC_HOME"
     chmod -R 755 "$OBSIDIAN_CNC_HOME/scripts"
     
-    # Start all services
     systemctl start obsidian-cluster-api.service
+    wait_for_service "obsidian-cluster-api" $HEALTH_CHECK_TIMEOUT
     
     # Create startup script
     cat > "$OBSIDIAN_CNC_HOME/scripts/startup.sh" << 'EOF'
@@ -1079,58 +1253,195 @@ echo "Obsidian C&C startup complete"
 EOF
     chmod +x "$OBSIDIAN_CNC_HOME/scripts/startup.sh"
 
-    # Clean up
     apt-get autoremove -y
     apt-get autoclean
+    
+    # Final comprehensive health check
+    run_final_health_check
 }
 
-# Main execution flow
+# Comprehensive final health check
+run_final_health_check() {
+    info "Running final comprehensive health check"
+    
+    local failed_services=()
+    
+    # Check system services
+    for service in nginx postgresql redis-server wg-quick@wg0 cockpit.socket obsidian-cluster-api docker; do
+        if ! systemctl is-active --quiet "$service"; then
+            failed_services+=("$service")
+            error "Service $service is not running"
+        else
+            info "Service $service is healthy"
+        fi
+    done
+    
+    # Check containers
+    for container in keycloak prometheus grafana node-exporter; do
+        if ! docker ps --filter "name=$container" --filter "status=running" | grep -q "$container"; then
+            failed_services+=("container:$container")
+            error "Container $container is not running"
+        else
+            info "Container $container is healthy"
+        fi
+    done
+    
+    if [[ ${#failed_services[@]} -gt 0 ]]; then
+        error "Final health check failed. Failed components: ${failed_services[*]}"
+        return 1
+    else
+        info "All services passed final health check"
+        return 0
+    fi
+}
+
+# Enhanced main execution with better error handling and environment detection
 main() {
     info "Starting Obsidian Command & Control Bootstrap Process"
-    info "Target: Ubuntu 24.04 LTS"
+    info "Environment: $([ "$IS_HEADLESS" == "true" ] && echo "Headless" || echo "Interactive")"
+    info "Target: Ubuntu 24.04 LTS (Hetzner Cloud Optimized)"
     info "Domain: $DOMAIN"
+    info "Network Interface: $NETWORK_INTERFACE"
     info "Date: $(date)"
     
+    # Log file locations for headless mode
+    if [[ "$IS_HEADLESS" == "true" ]]; then
+        info "Headless mode detected - logs are being written to:"
+        info "  - System logs: $LOG_FILE"
+        info "  - Root logs: $HEADLESS_LOG_FILE"
+        info "  - Error logs: $ERROR_LOG_FILE and $HEADLESS_ERROR_LOG_FILE"
+    fi
+    
+    # Environment validation
+    if [[ -z "${DOMAIN// }" ]] || [[ "$DOMAIN" == "localhost" ]]; then
+        warn "No domain configured, using localhost (not suitable for production)"
+    fi
+    
+    # Pre-flight checks
     check_root
-    setup_directories
-    update_system
-    install_docker
-    install_wireguard_server
-    install_cockpit_server
-    install_keycloak
-    install_monitoring
-    configure_nginx
-    configure_security
-    setup_backups
-    create_management_scripts
-    finalize_setup
     
-    # Print completion message
-    echo
+    # Create lock file to prevent concurrent executions
+    local lock_file="/var/lock/obsidian-cnc-bootstrap.lock"
+    if ! (
+        flock -n 200 || {
+            error "Another instance of this script is already running"
+            exit 1
+        }
+        
+        # Main installation sequence with enhanced error handling
+        local installation_steps=(
+            "setup_directories"
+            "update_system"
+            "install_docker"
+            "install_wireguard_server"
+            "install_cockpit_server"
+            "install_keycloak"
+            "install_monitoring"
+            "configure_nginx"
+            "configure_security"
+            "create_management_scripts"
+            "finalize_setup"
+        )
+        
+        local failed_steps=()
+        
+        for step in "${installation_steps[@]}"; do
+            info "Executing step: $step"
+            if ! $step; then
+                error "Step $step failed"
+                failed_steps+=("$step")
+                
+                # Try recovery for some steps
+                case "$step" in
+                    "install_docker"|"install_keycloak"|"install_monitoring")
+                        warn "Attempting recovery for $step..."
+                        systemctl daemon-reload || true
+                        sleep 30
+                        if ! $step; then
+                            error "Step $step failed on recovery"
+                        else
+                            info "Step $step recovered successfully"
+                            # Remove from failed steps if recovery succeeded
+                            unset 'failed_steps[-1]'
+                        fi
+                        ;;
+                esac
+            else
+                info "Step $step completed successfully"
+            fi
+        done
+        
+        # Report results
+        if [[ ${#failed_steps[@]} -gt 0 ]]; then
+            error "Bootstrap completed with ${#failed_steps[@]} failed steps: ${failed_steps[*]}"
+            exit 1
+        else
+            info "All installation steps completed successfully"
+        fi
+        
+    ) 200>"$lock_file"; then
+        exit 1
+    fi
+    
+    # Final success message
     info "Obsidian Command & Control Bootstrap Complete!"
-    echo
-    info "Access Points:"
-    info "- Main Dashboard: https://$DOMAIN"
-    info "- Grafana Monitoring: https://$DOMAIN/grafana"
-    info "- Keycloak SSO: https://$DOMAIN/auth"
-    echo
-    info "WireGuard Server Public Key (distribute to clients):"
-    cat "$OBSIDIAN_CNC_HOME/wireguard_server_public_key"
-    echo
-    info "Management Commands:"
-    info "- Node Management: $OBSIDIAN_CNC_HOME/scripts/manage_nodes.sh"
-    info "- Health Check: $OBSIDIAN_CNC_HOME/scripts/cnc_health_check.sh"
-    info "- Add VPN Client: $OBSIDIAN_CNC_HOME/scripts/add_wireguard_client.sh"
-    echo
-    warn "Complete the following manual steps:"
-    warn "1. Configure Keycloak realm and clients"
-    warn "2. Set up Grafana dashboards"
-    warn "3. Configure email notifications"
-    warn "4. Add first WireGuard clients"
+    info "All services are running and healthy"
+    info "Access Point: https://$DOMAIN"
+    info "WireGuard Server Public Key available at: $OBSIDIAN_CNC_HOME/wireguard_server_public_key"
+    info "Default client credentials available in: /root/wireguard-credentials/"
     
-    # Run initial health check
-    "$OBSIDIAN_CNC_HOME/scripts/cnc_health_check.sh"
+    # Headless mode summary
+    if [[ "$IS_HEADLESS" == "true" ]]; then
+        info "Headless deployment summary written to: $HEADLESS_LOG_FILE"
+        
+        # Create deployment summary in /root
+        cat > "/root/obsidian-cnc-deployment-summary.txt" << EOF
+Obsidian Command & Control - Deployment Summary
+===============================================
+Deployment Date: $(date)
+Domain: $DOMAIN
+Network Interface: $NETWORK_INTERFACE
+
+Services Status:
+$(systemctl is-active docker nginx postgresql wg-quick@wg0 cockpit.socket obsidian-cluster-api 2>/dev/null | sed 's/^/  - /')
+
+Access Points:
+  - Main Dashboard: https://$DOMAIN
+  - Grafana Monitoring: https://$DOMAIN/grafana
+  - Keycloak SSO: https://$DOMAIN/auth
+
+Credentials:
+  - Database Password: $DB_PASSWORD
+  - Keycloak Admin Password: $KEYCLOAK_ADMIN_PASSWORD
+  - Grafana Admin Password: $GRAFANA_ADMIN_PASSWORD
+
+Files Created:
+  - WireGuard Server Key: $OBSIDIAN_CNC_HOME/wireguard_server_public_key
+  - Default Client Configs: /root/wireguard-credentials/
+  - Full Logs: $HEADLESS_LOG_FILE
+  - Error Logs: $HEADLESS_ERROR_LOG_FILE
+
+Next Steps:
+  1. Configure DNS to point $DOMAIN to this server
+  2. Review default WireGuard client configurations in /root/wireguard-credentials/
+  3. Access Cockpit management interface at https://$DOMAIN
+  4. Configure Keycloak SSO realms and clients
+EOF
+        
+        info "Deployment summary saved to: /root/obsidian-cnc-deployment-summary.txt"
+    fi
+    
+    # Log final system state
+    info "Final system state:"
+    {
+        echo "=== Services Status ==="
+        systemctl status docker nginx postgresql wg-quick@wg0 cockpit.socket obsidian-cluster-api --no-pager -l 2>/dev/null || true
+        echo "=== Container Status ==="
+        docker ps 2>/dev/null || true
+        echo "=== Network Status ==="
+        ss -tuln | head -20 2>/dev/null || true
+    } >> "$LOG_FILE" 2>&1
 }
 
-# Execute main function
+# Execute main function with all arguments
 main "$@"

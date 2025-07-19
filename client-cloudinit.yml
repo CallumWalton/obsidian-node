@@ -211,6 +211,64 @@ write_files:
     permissions: '0755'
     owner: root:root
 
+  # Post-deployment VPN configuration script
+  - path: /opt/configure-vpn.sh
+    content: |
+      #!/bin/bash
+      # Configure VPN connection after C&C server provides details
+      
+      set -euo pipefail
+      
+      source /opt/obsidian-env
+      
+      echo "Retrieving WireGuard server public key from C&C server..." | tee -a /var/log/obsidian-vpn-config.log
+      
+      # Retry logic for server public key retrieval
+      MAX_ATTEMPTS=10
+      ATTEMPT=1
+      
+      while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
+          echo "Attempt $ATTEMPT/$MAX_ATTEMPTS to retrieve server public key" | tee -a /var/log/obsidian-vpn-config.log
+          
+          # Try to get server public key from C&C server
+          if SERVER_PUBLIC_KEY=$(curl -s --connect-timeout 10 --max-time 30 "https://${CNC_DOMAIN}/wireguard/public-key" 2>/dev/null); then
+              if [[ -n "$SERVER_PUBLIC_KEY" && ${#SERVER_PUBLIC_KEY} -gt 40 ]]; then
+                  echo "✓ Retrieved server public key" | tee -a /var/log/obsidian-vpn-config.log
+                  break
+              fi
+          fi
+          
+          # Fallback: try to get from server info endpoint
+          if SERVER_INFO=$(curl -s --connect-timeout 10 --max-time 30 "https://${CNC_DOMAIN}/api/server/info" 2>/dev/null); then
+              SERVER_PUBLIC_KEY=$(echo "$SERVER_INFO" | jq -r '.wireguard_public_key // empty' 2>/dev/null)
+              if [[ -n "$SERVER_PUBLIC_KEY" && ${#SERVER_PUBLIC_KEY} -gt 40 ]]; then
+                  echo "✓ Retrieved server public key from API" | tee -a /var/log/obsidian-vpn-config.log
+                  break
+              fi
+          fi
+          
+          echo "Failed to retrieve server public key, retrying in 30s..." | tee -a /var/log/obsidian-vpn-config.log
+          sleep 30
+          ((ATTEMPT++))
+      done
+      
+      if [[ -z "${SERVER_PUBLIC_KEY:-}" ]]; then
+          echo "ERROR: Could not retrieve server public key after $MAX_ATTEMPTS attempts" | tee -a /var/log/obsidian-vpn-config.log
+          echo "Please manually configure WireGuard with server public key" | tee -a /var/log/obsidian-vpn-config.log
+          exit 1
+      fi
+      
+      # Update WireGuard configuration
+      /opt/obsidian-node/scripts/update_wireguard_config.sh "${SERVER_PUBLIC_KEY}" "${NODE_VPN_IP}" "${CNC_DOMAIN}:${WG_PORT}"
+      
+      # Enable and start WireGuard
+      systemctl enable wg-quick@wg0.service
+      systemctl start wg-quick@wg0.service
+      
+      echo "VPN configuration complete" | tee -a /var/log/obsidian-vpn-config.log
+    permissions: '0755'
+    owner: root:root
+
 # System configuration
 bootcmd:
   # Ensure proper time sync

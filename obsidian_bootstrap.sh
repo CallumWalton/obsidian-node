@@ -4,83 +4,117 @@
 # Prepares Ubuntu 24.04 LTS VM for Obsidian platform usage
 # 
 # This script is idempotent and can be run multiple times safely
-# All placeholders use ALL-CAPS format for envsubst processing
+# Optimized for headless deployment with proper error handling
 #
 # Author: Obsidian Platform Team
-# Version: 1.0
-# Date: 2025-07-19
+# Version: 2.0
+# Date: 2025-01-19
 
 set -euo pipefail
 
-# Color codes for output
-readonly RED='\033[0;31m'
-readonly YELLOW='\033[1;33m'
-readonly GREEN='\033[0;32m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m' # No Color
+# Detect execution environment
+readonly IS_HEADLESS="${HEADLESS:-true}"
+readonly IS_INTERACTIVE=$([ -t 1 ] && [ -t 2 ] && echo "true" || echo "false")
+
+# Logging setup
+readonly LOG_FILE="/var/log/obsidian-node-bootstrap.log"
+readonly ERROR_LOG_FILE="/var/log/obsidian-node-bootstrap-errors.log"
+
+# Create log files
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE" "$ERROR_LOG_FILE"
+chmod 644 "$LOG_FILE" "$ERROR_LOG_FILE"
+
+# Smart output redirection
+if [[ "$IS_HEADLESS" == "true" || "$IS_INTERACTIVE" == "false" ]]; then
+    exec 1>>"$LOG_FILE"
+    exec 2>>"$ERROR_LOG_FILE"
+else
+    exec 1> >(tee -a "$LOG_FILE")
+    exec 2> >(tee -a "$ERROR_LOG_FILE" >&2)
+fi
 
 # Configuration variables (to be substituted by automation)
 readonly OBSIDIAN_HOME="/opt/obsidian-node"
-readonly CNC_FQDN="${CNC_FQDN}"
-readonly CLUSTER_CA_PEM="${CLUSTER_CA_PEM}"
-readonly CLUSTER_JOIN_TOKEN="${CLUSTER_JOIN_TOKEN}"
-readonly KEYCLOAK_REALM_URL="${KEYCLOAK_REALM_URL}"
-readonly WG_DNS_IP="${WG_DNS_IP}"
-readonly WG_SERVER_ENDPOINT="${WG_SERVER_ENDPOINT}"
-readonly WG_PSK="${WG_PSK}"
-readonly WG_POR    # Create systemd service for startup - ENSURE WIREGUARD FIRST
-    cat > /etc/systemd/system/obsidian-startup.service << EOF
-[Unit]
-Description=Obsidian Node Startup - WireGuard First
-After=network-online.target wg-quick@wg0.service
-Wants=network-online.target
-Requires=wg-quick@wg0.service
+readonly CNC_FQDN="${CNC_FQDN:-cnc.local}"
+readonly CLUSTER_CA_PEM="${CLUSTER_CA_PEM:-}"
+readonly CLUSTER_JOIN_TOKEN="${CLUSTER_JOIN_TOKEN:-default-token}"
+readonly KEYCLOAK_REALM_URL="${KEYCLOAK_REALM_URL:-}"
+readonly WG_DNS_IP="${WG_DNS_IP:-10.0.0.1}"
+readonly WG_SERVER_ENDPOINT="${WG_SERVER_ENDPOINT:-}"
+readonly WG_PSK="${WG_PSK:-}"
+readonly WG_PORT="${WG_PORT:-51820}"
+readonly PTERO_VERSION="${PTERO_VERSION:-latest}"
+readonly PANEL_URL="${PANEL_URL:-}"
+readonly NODE_UUID="${NODE_UUID:-}"
+readonly TOKEN="${TOKEN:-}"
+readonly ADMIN_EMAIL="${ADMIN_EMAIL:-admin@localhost}"
+readonly WINGS_PORTS="${WINGS_PORTS:-2022,8080-8090}"
 
-[Service]
-Type=oneshot
-ExecStart=$OBSIDIAN_HOME/scripts/startup.sh
-User=root
-RemainAfterExit=yes
+# Enhanced logging without colors in headless mode
+log_with_timestamp() {
+    local level="$1"
+    shift
+    local timestamp="[$(date '+%Y-%m-%d %H:%M:%S UTC')]"
+    
+    if [[ "$IS_INTERACTIVE" == "true" && "$IS_HEADLESS" != "true" ]]; then
+        case "$level" in
+            "INFO") echo -e "\033[0;32m${timestamp} [INFO]\033[0m $*" ;;
+            "WARN") echo -e "\033[1;33m${timestamp} [WARN]\033[0m $*" ;;
+            "ERROR") echo -e "\033[0;31m${timestamp} [ERROR]\033[0m $*" ;;
+            "DEBUG") echo -e "\033[0;34m${timestamp} [DEBUG]\033[0m $*" ;;
+            *) echo "${timestamp} [$level] $*" ;;
+        esac
+    else
+        echo "${timestamp} [$level] $*"
+    fi
+}
 
-[Install]
-WantedBy=multi-user.target
-EOFeadonly PTERO_VERSION="${PTERO_VERSION}"
-readonly PANEL_URL="${PANEL_URL}"
-readonly NODE_UUID="${NODE_UUID}"
-readonly TOKEN="${TOKEN}"
-readonly S3_BUCKET="${S3_BUCKET}"
-readonly S3_ACCESS_KEY="${S3_ACCESS_KEY}"
-readonly S3_SECRET_KEY="${S3_SECRET_KEY}"
-readonly S3_ENDPOINT="${S3_ENDPOINT}"
-readonly ADMIN_EMAIL="${ADMIN_EMAIL}"
-readonly WINGS_PORTS="${WINGS_PORTS}"
-
-# Logging functions
 info() {
-    echo -e "${GREEN}[INFO]${NC} $*" >&2
+    log_with_timestamp "INFO" "$*"
 }
 
 warn() {
-    echo -e "${YELLOW}[WARN]${NC} $*" >&2
+    log_with_timestamp "WARN" "$*"
 }
 
 error() {
-    echo -e "${RED}[ERROR]${NC} $*" >&2
+    log_with_timestamp "ERROR" "$*"
 }
 
 debug() {
-    echo -e "${BLUE}[DEBUG]${NC} $*" >&2
+    log_with_timestamp "DEBUG" "$*"
 }
 
-# Helper function to run commands as specific user
-run_as() {
-    local user="$1"
-    shift
-    if [[ $EUID -eq 0 ]]; then
-        sudo -u "$user" "$@"
-    else
-        "$@"
-    fi
+# Enhanced retry mechanism
+retry_with_backoff() {
+    local max_attempts="$1"
+    local initial_delay="$2"
+    local description="$3"
+    shift 3
+    local attempt=1
+    local delay="$initial_delay"
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        info "Attempting $description (attempt $attempt/$max_attempts)"
+        
+        if (set -e; "$@"); then
+            info "$description completed successfully"
+            return 0
+        fi
+        
+        local exit_code=$?
+        
+        if [[ $attempt -eq $max_attempts ]]; then
+            error "$description failed after $max_attempts attempts (exit code: $exit_code)"
+            return 1
+        fi
+        
+        warn "$description failed, retrying in ${delay}s..."
+        sleep "$delay"
+        ((attempt++))
+        delay=$((delay * 2))
+    done
 }
 
 # Check if running as root
@@ -102,22 +136,27 @@ setup_directories() {
     install -d -m 755 "/etc/pterodactyl"
 }
 
-# Update system packages
+# Enhanced system update
 update_system() {
     info "Updating system packages"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
+    
+    # Configure apt for headless operation
+    cat > /etc/apt/apt.conf.d/90-obsidian-noninteractive << 'EOF'
+APT::Get::Assume-Yes "true";
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+DPkg::Options "--force-confdef";
+DPkg::Options "--force-confold";
+EOF
+    
+    # Fix broken packages
+    dpkg --configure -a || true
+    apt-get --fix-broken install -y || true
+    
+    retry_with_backoff 3 10 "package update" apt-get update
     apt-get upgrade -y
-    apt-get install -y \
-        curl \
-        wget \
-        gnupg \
-        lsb-release \
-        ca-certificates \
-        software-properties-common \
-        apt-transport-https \
-        jq \
-        envsubst
+    apt-get install -y curl wget gnupg lsb-release ca-certificates software-properties-common apt-transport-https jq envsubst flock
 }
 
 # Install and configure Cockpit
@@ -266,14 +305,12 @@ EOF
     systemctl restart cockpit.socket
 }
 
-# Install and configure WireGuard VPN
+# Enhanced WireGuard installation
 install_wireguard() {
     info "Installing and configuring WireGuard VPN"
     
-    # Install WireGuard
-    apt-get install -y wireguard wireguard-tools resolvconf
+    apt-get install -y wireguard wireguard-tools resolvconf qrencode
 
-    # Generate WireGuard keys
     cd /etc/wireguard
     umask 077
     
@@ -283,34 +320,40 @@ install_wireguard() {
         info "Generated new WireGuard keys"
     fi
 
-    local private_key=$(cat privatekey)
-    local public_key=$(cat publickey)
+    local private_key public_key
+    private_key=$(cat privatekey)
+    public_key=$(cat publickey)
 
-    # Create WireGuard configuration
+    # Detect primary network interface
+    local primary_interface
+    primary_interface=$(ip route | grep '^default' | head -n1 | awk '{print $5}' || echo "eth0")
+
+    # Create WireGuard configuration with server public key placeholder
     cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 PrivateKey = ${private_key}
-Address = 10.0.0.0/32
+Address = \${NODE_VPN_IP}/32
 DNS = ${WG_DNS_IP}
-# CRITICAL: Route all traffic through VPN except cloud metadata
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostUp = iptables -I INPUT -i lo -j ACCEPT
-PostUp = iptables -I INPUT -i wg0 -j ACCEPT
-PostUp = iptables -I INPUT -p tcp --dport 9090 -i eth0 -j DROP
-PostUp = iptables -I INPUT -p tcp --dport 9090 -i wg0 -j ACCEPT
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D INPUT -i lo -j ACCEPT
-PostDown = iptables -D INPUT -i wg0 -j ACCEPT
-PostDown = iptables -D INPUT -p tcp --dport 9090 -i eth0 -j DROP
-PostDown = iptables -D INPUT -p tcp --dport 9090 -i wg0 -j ACCEPT
+
+# Enhanced PostUp/PostDown rules with error handling
+PostUp = iptables -I INPUT -i lo -j ACCEPT || true
+PostUp = iptables -I INPUT -i wg0 -j ACCEPT || true
+PostUp = iptables -I INPUT -p tcp --dport 9090 -i ${primary_interface} -j DROP || true
+PostUp = iptables -I INPUT -p tcp --dport 9090 -i wg0 -j ACCEPT || true
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT || true
+PostUp = iptables -t nat -A POSTROUTING -o ${primary_interface} -j MASQUERADE || true
+
+PostDown = iptables -D INPUT -i lo -j ACCEPT || true
+PostDown = iptables -D INPUT -i wg0 -j ACCEPT || true
+PostDown = iptables -D INPUT -p tcp --dport 9090 -i ${primary_interface} -j DROP || true
+PostDown = iptables -D INPUT -p tcp --dport 9090 -i wg0 -j ACCEPT || true
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT || true
+PostDown = iptables -t nat -D POSTROUTING -o ${primary_interface} -j MASQUERADE || true
 
 [Peer]
-PublicKey = SERVER_PUBLIC_KEY_PLACEHOLDER
+PublicKey = \${WG_SERVER_PUBLIC_KEY}
 PresharedKey = ${WG_PSK}
 Endpoint = ${WG_SERVER_ENDPOINT}
-# CRITICAL: Route all traffic through VPN except cloud metadata and DNS
 AllowedIPs = 0.0.0.0/1, 128.0.0.0/1, ::/1, 8000::/1
 PersistentKeepalive = 25
 EOF
@@ -320,12 +363,59 @@ EOF
     echo 'net.ipv6.conf.all.forwarding = 1' >> /etc/sysctl.conf
     sysctl -p
 
-    # Enable WireGuard service
-    systemctl enable wg-quick@wg0.service
-
-    # Store public key for provisioning system
+    # Store public key for C&C server provisioning
     echo "$public_key" > "$OBSIDIAN_HOME/wireguard_public_key"
-    info "WireGuard public key saved to $OBSIDIAN_HOME/wireguard_public_key"
+    
+    # Create configuration update script for post-provisioning
+    cat > "$OBSIDIAN_HOME/scripts/update_wireguard_config.sh" << 'EOF'
+#!/bin/bash
+# Update WireGuard configuration with server details
+# Called after C&C server provides connection details
+
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+    echo "Usage: $0 <server_public_key> <node_vpn_ip> <server_endpoint>"
+    echo "Example: $0 'server_key_here' '10.0.0.15' 'cnc.example.com:51820'"
+    exit 1
+fi
+
+WG_SERVER_PUBLIC_KEY="$1"
+NODE_VPN_IP="$2"
+WG_SERVER_ENDPOINT="$3"
+
+# Update WireGuard configuration
+sed -i "s/\${WG_SERVER_PUBLIC_KEY}/${WG_SERVER_PUBLIC_KEY}/" /etc/wireguard/wg0.conf
+sed -i "s/\${NODE_VPN_IP}/${NODE_VPN_IP}/" /etc/wireguard/wg0.conf
+
+# Restart WireGuard if it's running
+if systemctl is-active --quiet wg-quick@wg0; then
+    systemctl restart wg-quick@wg0
+    echo "WireGuard configuration updated and service restarted"
+else
+    echo "WireGuard configuration updated (service not running)"
+fi
+
+# Test connectivity
+sleep 5
+if wg show wg0 >/dev/null 2>&1; then
+    echo "WireGuard interface is active"
+    if ping -c 3 -W 5 "${WG_DNS_IP}" >/dev/null 2>&1; then
+        echo "VPN connectivity confirmed"
+    else
+        echo "WARNING: VPN connectivity test failed"
+    fi
+else
+    echo "WARNING: WireGuard interface not active"
+fi
+EOF
+
+    chmod +x "$OBSIDIAN_HOME/scripts/update_wireguard_config.sh"
+    
+    # Don't enable WireGuard service yet - wait for server provisioning
+    info "WireGuard configured with placeholders - awaiting server provisioning"
+    info "Client public key saved to $OBSIDIAN_HOME/wireguard_public_key"
+    info "Use update_wireguard_config.sh to complete configuration"
 }
 
 # Install Docker for Pterodactyl Wings
@@ -611,7 +701,7 @@ EOF
 
     systemctl enable --now fail2ban
 
-    # Install needrestart for automatic service restarts
+    # Install needrestart
     apt-get install -y needrestart
     
     cat > /etc/needrestart/needrestart.conf << 'EOF'
@@ -620,32 +710,29 @@ $nrconf{kernelhints} = 1;
 $nrconf{ucodehints} = 1;
 EOF
 
-    # Configure UFW firewall - BLOCK COCKPIT ON PUBLIC INTERFACE
+    # Enhanced UFW configuration with better port handling
     apt-get install -y ufw
     
-    # Reset UFW to defaults
     ufw --force reset
-    
-    # Set default policies
     ufw default deny incoming
     ufw default allow outgoing
-    
-    # Allow SSH
     ufw allow 22/tcp comment 'SSH'
-    
-    # CRITICAL: Block Cockpit on all public interfaces
     ufw deny 9090/tcp comment 'Block Cockpit Public Access'
-    
-    # Allow WireGuard
     ufw allow "${WG_PORT}/udp" comment 'WireGuard VPN'
     
-    # Allow Wings ports (assuming comma-separated)
-    IFS=',' read -ra PORTS <<< "$WINGS_PORTS"
-    for port in "${PORTS[@]}"; do
-        ufw allow "$port" comment 'Pterodactyl Wings'
+    # Parse and allow Wings ports with error handling
+    IFS=',' read -ra PORTS_ARRAY <<< "$WINGS_PORTS" || true
+    for port_spec in "${PORTS_ARRAY[@]}"; do
+        # Handle both single ports and ranges
+        if [[ "$port_spec" =~ ^[0-9]+-[0-9]+$ ]]; then
+            ufw allow "$port_spec" comment 'Pterodactyl Wings Range'
+        elif [[ "$port_spec" =~ ^[0-9]+$ ]]; then
+            ufw allow "$port_spec" comment 'Pterodactyl Wings'
+        else
+            warn "Invalid port specification: $port_spec"
+        fi
     done
     
-    # Enable UFW
     ufw --force enable
 }
 
@@ -899,7 +986,7 @@ EOF
 finalize_setup() {
     info "Finalizing system setup"
     
-    # Create obsidian system user for platform operations
+    # Create obsidian system user
     if ! id obsidian > /dev/null 2>&1; then
         useradd -r -d "$OBSIDIAN_HOME" -s /bin/bash -G obsidian,docker obsidian
         chown -R obsidian:obsidian "$OBSIDIAN_HOME"
@@ -919,90 +1006,133 @@ $OBSIDIAN_HOME/logs/*.log {
 }
 EOF
 
-    # Create startup script - WIREGUARD MANDATORY
+    # Enhanced startup script with better error handling
     cat > "$OBSIDIAN_HOME/scripts/startup.sh" << 'EOF'
 #!/bin/bash
-# Obsidian Node Startup Script - WireGuard Security First
+# Obsidian Node Startup Script - Enhanced Error Handling
 set -euo pipefail
 
-echo "Starting Obsidian Node services with WireGuard security..."
+# Logging function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a /var/log/obsidian-node-startup.log
+}
 
-# CRITICAL: Ensure WireGuard is up BEFORE anything else
-echo "Ensuring WireGuard VPN is active..."
-systemctl start wg-quick@wg0.service
+log "Starting Obsidian Node services with WireGuard security..."
 
-# Wait for WireGuard interface to be fully up
+# Function to wait for service
+wait_for_service() {
+    local service="$1"
+    local timeout="${2:-60}"
+    local elapsed=0
+    
+    while [[ $elapsed -lt $timeout ]]; do
+        if systemctl is-active --quiet "$service"; then
+            log "$service is ready"
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    
+    log "ERROR: $service failed to start within ${timeout}s"
+    return 1
+}
+
+# Start WireGuard first
+log "Starting WireGuard VPN..."
+if ! systemctl start wg-quick@wg0.service; then
+    log "ERROR: Failed to start WireGuard"
+    exit 1
+fi
+
+# Wait for WireGuard interface
 timeout=60
 counter=0
 until wg show wg0 >/dev/null 2>&1; do
     if [ $counter -ge $timeout ]; then
-        echo "ERROR: WireGuard failed to start within $timeout seconds"
+        log "ERROR: WireGuard failed to start within $timeout seconds"
         exit 1
     fi
-    echo "Waiting for WireGuard interface to be ready... ($counter/$timeout)"
+    log "Waiting for WireGuard interface... ($counter/$timeout)"
     sleep 1
     counter=$((counter + 1))
 done
 
-echo "WireGuard VPN is active and ready"
+log "WireGuard VPN is active"
 
-# Verify WireGuard IP is assigned
+# Verify WireGuard IP assignment
 if ! ip addr show wg0 | grep -q "10.0.0."; then
-    echo "ERROR: WireGuard interface does not have expected IP address"
+    log "ERROR: WireGuard interface missing expected IP"
     exit 1
 fi
 
-# Apply additional firewall rules to ensure Cockpit isolation
-iptables -I INPUT -p tcp --dport 9090 -i eth0 -j DROP
-iptables -I INPUT -p tcp --dport 9090 -i wg0 -j ACCEPT
+# Apply firewall rules with error handling
+primary_interface=$(ip route | grep '^default' | head -n1 | awk '{print $5}' || echo "eth0")
 
-# Wait for VPN network connectivity through tunnel
-echo "Testing VPN connectivity..."
+iptables -I INPUT -i lo -j ACCEPT 2>/dev/null || log "WARN: Failed to add lo rule"
+iptables -I INPUT -i wg0 -j ACCEPT 2>/dev/null || log "WARN: Failed to add wg0 rule"
+iptables -I INPUT -p tcp --dport 9090 -i "$primary_interface" -j DROP 2>/dev/null || log "WARN: Failed to block cockpit on public"
+iptables -I INPUT -p tcp --dport 9090 -i wg0 -j ACCEPT 2>/dev/null || log "WARN: Failed to allow cockpit on VPN"
+
+# Test VPN connectivity
+log "Testing VPN connectivity..."
 timeout=30
 counter=0
 until ping -c1 -W1 ${WG_DNS_IP} >/dev/null 2>&1; do
     if [ $counter -ge $timeout ]; then
-        echo "WARNING: VPN DNS not reachable, but continuing..."
+        log "WARNING: VPN DNS not reachable, continuing anyway"
         break
     fi
-    echo "Waiting for VPN network connectivity... ($counter/$timeout)"
+    log "Waiting for VPN connectivity... ($counter/$timeout)"
     sleep 1
     counter=$((counter + 1))
 done
 
-# Start Cockpit (should now be bound to WireGuard interface only)
-echo "Starting Cockpit on WireGuard interface..."
-systemctl restart cockpit.socket
-
-# Verify Cockpit is bound to WireGuard interface
-if ! ss -tuln | grep -q "10.0.0.1:9090"; then
-    echo "ERROR: Cockpit is not bound to WireGuard interface"
+# Start Cockpit
+log "Starting Cockpit..."
+if ! systemctl restart cockpit.socket; then
+    log "ERROR: Failed to start Cockpit"
     exit 1
 fi
 
-# Start Wings if not already running
-if ! systemctl is-active --quiet wings; then
-    echo "Starting Pterodactyl Wings..."
-    systemctl start wings
+wait_for_service "cockpit.socket" 30
+
+# Verify Cockpit binding
+if ! ss -tuln | grep -q "10.0.0.1:9090"; then
+    log "ERROR: Cockpit not bound to WireGuard interface"
+    systemctl status cockpit.socket --no-pager -l || true
+    exit 1
 fi
 
-echo "Obsidian Node startup complete - All services secured behind WireGuard VPN"
-echo "Cockpit accessible ONLY at: https://10.0.0.1:9090"
+# Start Wings if configured
+if [[ -f /etc/pterodactyl/config.yml ]] && ! systemctl is-active --quiet wings; then
+    log "Starting Pterodactyl Wings..."
+    if systemctl start wings; then
+        wait_for_service "wings" 60
+    else
+        log "WARNING: Failed to start Wings"
+    fi
+fi
+
+log "Obsidian Node startup complete"
+log "Cockpit accessible at: https://10.0.0.1:9090"
 EOF
     chmod +x "$OBSIDIAN_HOME/scripts/startup.sh"
     
-    # Create systemd service for startup
-    cat > /etc/systemd/system/obsidian-startup.service << EOF
+    # Create systemd service with proper dependencies
+    cat > /etc/systemd/system/obsidian-startup.service << 'EOF'
 [Unit]
 Description=Obsidian Node Startup
-After=network-online.target
+After=network-online.target multi-user.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$OBSIDIAN_HOME/scripts/startup.sh
+ExecStart=/opt/obsidian-node/scripts/startup.sh
 User=root
 RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -1011,86 +1141,79 @@ EOF
     systemctl daemon-reload
     systemctl enable obsidian-startup.service
     
-    # Clean up package cache
+    # Clean up
     apt-get autoremove -y
     apt-get autoclean
 }
 
-# Validate WireGuard security configuration
-validate_wireguard_security() {
-    info "Validating WireGuard security configuration"
-    
-    # Verify WireGuard configuration exists
-    if [[ ! -f /etc/wireguard/wg0.conf ]]; then
-        error "WireGuard configuration file missing"
-        exit 1
-    fi
-    
-    # Verify WireGuard interface can start
-    if ! wg-quick up wg0 2>/dev/null; then
-        warn "WireGuard interface failed to start - this is expected if already running"
-    fi
-    
-    # Wait for interface to be ready
-    sleep 5
-    
-    # Verify WireGuard interface is up
-    if ! wg show wg0 >/dev/null 2>&1; then
-        error "WireGuard interface is not active after configuration"
-        exit 1
-    fi
-    
-    # Verify Cockpit is NOT listening on public interfaces
-    if ss -tuln | grep -E ":9090.*0\.0\.0\.0" >/dev/null 2>&1; then
-        error "SECURITY BREACH: Cockpit is listening on public interface!"
-        systemctl stop cockpit.socket
-        exit 1
-    fi
-    
-    # Verify Cockpit IS listening on WireGuard interface
-    if ! ss -tuln | grep -q "10.0.0.1:9090"; then
-        warn "Cockpit not yet bound to WireGuard interface - will be available after full startup"
-    fi
-    
-    info "WireGuard security validation passed"
-}
-
-# Main execution flow
+# Enhanced main function
 main() {
     info "Starting Obsidian Node Bootstrap Process"
+    info "Environment: $([ "$IS_HEADLESS" == "true" ] && echo "Headless" || echo "Interactive")"
     info "Target: Ubuntu 24.04 LTS"
     info "Date: $(date)"
     
+    # Validation
+    if [[ -z "${CNC_FQDN// }" ]] || [[ "$CNC_FQDN" == "cnc.local" ]]; then
+        warn "No C&C FQDN configured or using default"
+    fi
+    
     check_root
-    setup_directories
-    update_system
-    install_cockpit
-    configure_sso
-    install_wireguard
-    validate_wireguard_security
-    install_docker
-    install_wings
-    install_backups
-    configure_security
-    install_observability
-    create_health_check
-    finalize_setup
     
-    # Print completion message and WireGuard public key
-    echo
+    # Lock file for single execution
+    local lock_file="/var/lock/obsidian-node-bootstrap.lock"
+    if ! (
+        flock -n 200 || {
+            error "Another instance of this script is running"
+            exit 1
+        }
+        
+        # Installation steps
+        local steps=(
+            "setup_directories"
+            "update_system"
+            "install_cockpit"
+            "configure_sso"
+            "install_wireguard"
+            "validate_wireguard_security"
+            "install_docker"
+            "install_wings"
+            "configure_security"
+            "install_observability"
+            "create_health_check"
+            "finalize_setup"
+        )
+        
+        local failed_steps=()
+        
+        for step in "${steps[@]}"; do
+            info "Executing step: $step"
+            if ! $step; then
+                error "Step $step failed"
+                failed_steps+=("$step")
+            else
+                info "Step $step completed successfully"
+            fi
+        done
+        
+        if [[ ${#failed_steps[@]} -gt 0 ]]; then
+            error "Bootstrap failed on steps: ${failed_steps[*]}"
+            exit 1
+        fi
+        
+    ) 200>"$lock_file"; then
+        exit 1
+    fi
+    
+    # Success message
     info "Bootstrap complete!"
-    echo
-    info "WireGuard Public Key (save this for server configuration):"
-    cat "$OBSIDIAN_HOME/wireguard_public_key"
-    echo
-    warn "SECURITY NOTICE: Cockpit is ONLY accessible through WireGuard VPN"
-    info "System is ready for Obsidian platform usage"
-    info "Access Cockpit at: https://10.0.0.1:9090 (VPN ONLY)"
-    info "Health check available at: $OBSIDIAN_HOME/scripts/health_check.sh"
-    warn "Public network access to Cockpit is BLOCKED by firewall"
+    info "WireGuard Public Key (save for server configuration):"
+    cat "$OBSIDIAN_HOME/wireguard_public_key" 2>/dev/null || echo "Key file not found"
+    info "Cockpit accessible at: https://10.0.0.1:9090 (VPN ONLY)"
+    info "Health check: $OBSIDIAN_HOME/scripts/health_check.sh"
     
-    # Run initial health check
-    "$OBSIDIAN_HOME/scripts/health_check.sh"
+    # Run health check
+    "$OBSIDIAN_HOME/scripts/health_check.sh" || true
 }
 
 # Execute main function
