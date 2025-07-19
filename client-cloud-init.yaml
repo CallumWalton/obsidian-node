@@ -1,0 +1,166 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - curl
+  - jq
+  - nftables
+  - fail2ban
+  - unattended-upgrades
+
+write_files:
+  - path: /usr/local/bin/install-headscale.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+      echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main" | tee /etc/apt/sources.list.d/tailscale.list
+      apt-get update && apt-get install -y tailscale
+      tailscale up --login-server=https://control.${DOMAIN}:8080 --authkey=${NODE_AUTH_KEY}
+
+  - path: /usr/local/bin/install-wings.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      mkdir -p /etc/pterodactyl
+      curl -L -o /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64"
+      chmod u+x /usr/local/bin/wings
+      
+      cat > /etc/systemd/system/wings.service <<EOF
+      [Unit]
+      Description=Pterodactyl Wings Daemon
+      After=docker.service
+      Requires=docker.service
+      PartOf=docker.service
+      
+      [Service]
+      User=root
+      WorkingDirectory=/etc/pterodactyl
+      LimitNOFILE=4096
+      PIDFile=/var/run/wings/daemon.pid
+      ExecStart=/usr/local/bin/wings
+      Restart=on-failure
+      StartLimitInterval=180
+      StartLimitBurst=30
+      RestartSec=5s
+      
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      
+      systemctl enable --now wings
+
+  - path: /usr/local/bin/install-vmagent.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      curl -L -o /tmp/vmagent.tar.gz https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.96.0/vmagent-linux-amd64-v1.96.0.tar.gz
+      tar -xzf /tmp/vmagent.tar.gz -C /usr/local/bin
+      
+      cat > /etc/systemd/system/vmagent.service <<EOF
+      [Unit]
+      Description=VictoriaMetrics Agent
+      After=network.target
+      
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/vmagent-prod \
+        -promscrape.config=/etc/vmagent/prometheus.yml \
+        -remoteWrite.url=http://control.${DOMAIN}/metrics/api/v1/write \
+        -httpListenAddr=127.0.0.1:8429
+      Restart=always
+      
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      
+      mkdir -p /etc/vmagent
+      cat > /etc/vmagent/prometheus.yml <<EOF
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: node
+          static_configs:
+            - targets: ['localhost:9100']
+        - job_name: wings
+          static_configs:
+            - targets: ['localhost:8080']
+      EOF
+      
+      systemctl enable --now vmagent
+
+  - path: /usr/local/bin/install-fluent-bit.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      curl -L https://packages.fluentbit.io/fluentbit.key | apt-key add -
+      echo "deb https://packages.fluentbit.io/ubuntu/jammy jammy main" >> /etc/apt/sources.list
+      apt-get update && apt-get install -y fluent-bit
+      
+      cat > /etc/fluent-bit/fluent-bit.conf <<EOF
+      [SERVICE]
+          Daemon off
+          Log_Level info
+          
+      [INPUT]
+          Name systemd
+          Tag host.*
+          
+      [INPUT]
+          Name tail
+          Path /var/log/pterodactyl/wings.log
+          Tag wings.*
+          
+      [OUTPUT]
+          Name loki
+          Match *
+          Host control.${DOMAIN}
+          Port 3100
+          Labels job=gamenode,instance=${HOSTNAME}
+      EOF
+      
+      systemctl enable --now fluent-bit
+
+  - path: /etc/nftables.conf
+    content: |
+      #!/usr/sbin/nft -f
+      flush ruleset
+      
+      table inet filter {
+        chain input {
+          type filter hook input priority filter; policy drop;
+          iif lo accept
+          ct state established,related accept
+          ip saddr 100.64.0.0/10 accept comment "Headscale management"
+          tcp dport { ${GAME_PORTS_TCP} } accept comment "Game ports"
+          udp dport { ${GAME_PORTS_UDP} } accept comment "Game ports"
+        }
+      }
+
+  - path: /etc/fail2ban/jail.local
+    content: |
+      [DEFAULT]
+      bantime = 3600
+      findtime = 600
+      maxretry = 5
+      
+      [sshd]
+      enabled = false
+      
+      [game-ddos]
+      enabled = true
+      filter = game-ddos
+      action = nftables-multiport[name=game-ddos, port="${GAME_PORTS_TCP}"]
+      logpath = /var/log/syslog
+      maxretry = 100
+      findtime = 60
+      bantime = 600
+
+runcmd:
+  - /usr/local/bin/install-headscale.sh
+  - /usr/local/bin/install-wings.sh
+  - /usr/local/bin/install-vmagent.sh
+  - /usr/local/bin/install-fluent-bit.sh
+  - systemctl enable --now nftables
+  - systemctl enable --now fail2ban
+  - systemctl enable --now unattended-upgrades
