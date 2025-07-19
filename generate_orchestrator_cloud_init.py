@@ -36,6 +36,7 @@ write_files:
       Volume=/etc/headscale:/etc/headscale:ro,Z
       PublishPort=8080:8080
       Environment=HEADSCALE_LOG_LEVEL=info
+      Exec=headscale serve
       
       [Service]
       Restart=always
